@@ -22,7 +22,7 @@ before(async () => {
   base = `http://127.0.0.1:${port}`;
   tempDir = await mkdtemp(join(tmpdir(), 'mp3vid-test-'));
   server = spawn(process.execPath, ['server/index.js'], {
-    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), OPENAI_API_KEY: '', FFMPEG_PATH: ffmpeg.path },
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), FFMPEG_PATH: ffmpeg.path },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await new Promise((resolve, reject) => {
@@ -44,17 +44,11 @@ after(async () => {
   if (tempDir) await rm(tempDir, { recursive: true, force: true });
 });
 
-test('status and Whisper validation work without a configured key', async () => {
+test('status reports MP4 export availability and no transcription service', async () => {
   const status = await fetch(`${base}/api/status`);
-  assert.deepEqual(await status.json(), { whisperConfigured: false, mp4ExportAvailable: true });
-  const missingKey = await fetch(`${base}/api/transcribe`, { method: 'POST' });
-  assert.equal(missingKey.status, 401);
-  const missingAudio = await fetch(`${base}/api/transcribe`, { method: 'POST', headers: { 'X-Whisper-Key': 'test-only' } });
-  assert.equal(missingAudio.status, 400);
-  const form = new FormData();
-  form.append('audio', new Blob(['not an mp3']), 'track.wav');
-  const wrongType = await fetch(`${base}/api/transcribe`, { method: 'POST', headers: { 'X-Whisper-Key': 'test-only' }, body: form });
-  assert.equal(wrongType.status, 400);
+  assert.deepEqual(await status.json(), { mp4ExportAvailable: true });
+  const removed = await fetch(`${base}/api/transcribe`, { method: 'POST' });
+  assert.equal(removed.status, 404);
 });
 
 test('export converts a captured WebM to an H.264/AAC MP4', { timeout: 30_000 }, async () => {

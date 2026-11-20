@@ -1,15 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzeAudio, captionAtTime, findBestHook, formatTime, manualCaptions, wordsToCaptions } from '../src/audio.js';
+import {
+  analyzeAudio, analyzeTimeline, captionAtTime, findBestHook, formatPrecise, formatTime, manualCaptions, scoreWindows,
+} from '../src/audio.js';
 
 function makeBuffer(levels, sampleRate = 100) {
   const data = Float32Array.from(levels.flatMap(level => Array(100).fill(level)));
   return { sampleRate, length: data.length, duration: data.length / sampleRate, numberOfChannels: 1, getChannelData: () => data };
 }
 
+function makeSignal(sampleRate, seconds, sample) {
+  const length = Math.round(sampleRate * seconds);
+  const data = new Float32Array(length);
+  for (let i = 0; i < length; i++) data[i] = sample(i / sampleRate, i);
+  return { sampleRate, length, duration: seconds, numberOfChannels: 1, getChannelData: () => data };
+}
+
 test('time formatting handles missing and long values', () => {
   assert.equal(formatTime(NaN), '0:00');
   assert.equal(formatTime(65.9), '1:05');
+  assert.equal(formatPrecise(65.94), '1:05.9');
 });
 
 test('waveform analysis and hook scoring favor the energetic section', () => {
@@ -24,16 +34,12 @@ test('short tracks select from the beginning', () => {
   assert.equal(findBestHook(analyzeAudio(makeBuffer([0.1, 0.2])), 15), 0);
 });
 
-test('Whisper words become time-coded caption phrases', () => {
-  const words = [
-    { word: 'hello', start: 1, end: 1.2 },
-    { word: 'world.', start: 1.3, end: 1.7 },
-    { word: 'again', start: 2, end: 2.3 },
-  ];
-  const captions = wordsToCaptions(words);
-  assert.deepEqual(captions.map(x => x.text), ['hello world.', 'again']);
-  assert.equal(captionAtTime(captions, 1.4), 'hello world.');
-  assert.equal(captionAtTime(captions, 2.1), 'again');
+test('hook scores are normalized and agree with the chosen start', () => {
+  const analysis = { duration: 12, step: 1, envelope: [0.1, 0.1, 0.2, 0.9, 0.9, 0.9, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1] };
+  const { values, best } = scoreWindows(analysis, 3);
+  assert.equal(Math.max(...values), 1);
+  assert.equal(best, findBestHook(analysis, 3));
+  assert.equal(values.length, analysis.envelope.length);
 });
 
 test('manual captions divide the selected clip into equal blocks', () => {
@@ -45,14 +51,6 @@ test('manual captions divide the selected clip into equal blocks', () => {
   assert.equal(captionAtTime(captions, 17), 'last card');
 });
 
-test('segment-only transcription is split into readable, timed captions', () => {
-  const captions = wordsToCaptions([], [{ start: 2, end: 8, text: 'one two three four five six seven eight nine ten' }]);
-  assert.deepEqual(captions, [
-    { start: 2, end: 5, text: 'one two three four five' },
-    { start: 5, end: 8, text: 'six seven eight nine ten' },
-  ]);
-});
-
 test('out-of-phase stereo still contributes to the energy envelope', () => {
   const left = Float32Array.from({ length: 400 }, () => 0.5);
   const right = Float32Array.from({ length: 400 }, () => -0.5);
@@ -60,12 +58,38 @@ test('out-of-phase stereo still contributes to the energy envelope', () => {
   assert.ok(analysis.envelope.every(energy => energy > 0.49));
 });
 
-test('repeated Whisper word pairs add a modest hook bonus', () => {
-  const analysis = { duration: 12, step: 1, envelope: Array(12).fill(0.1) };
-  const words = [
-    { word: '  Let', start: 6 }, { word: 'go!', start: 6.4 },
-    { word: 'Let', start: 7 }, { word: ' go', start: 7.4 },
-  ];
-  const start = findBestHook(analysis, 3, words);
-  assert.ok(start >= 5 && start <= 7, `repeated phrase selected start ${start}`);
+test('timeline finds where audible sound starts and ends', () => {
+  const buffer = makeSignal(8000, 10, (t) => (t >= 2 && t < 8 ? 0.3 * Math.sin(2 * Math.PI * 220 * t) : 0));
+  const timeline = analyzeTimeline(buffer);
+  assert.ok(Math.abs(timeline.audioStart - 2) < 0.05, `start ${timeline.audioStart}`);
+  assert.ok(Math.abs(timeline.audioEnd - 8) < 0.05, `end ${timeline.audioEnd}`);
+});
+
+test('a steady click track yields its tempo and beat phase', () => {
+  // Kicks every 0.5 s (120 BPM), first kick at 0.25 s.
+  const buffer = makeSignal(8000, 16, (t) => {
+    const local = (t - 0.25) % 0.5;
+    const inClick = t >= 0.25 && local >= 0 && local < 0.1;
+    return inClick ? 0.8 * Math.sin(2 * Math.PI * 60 * local) * Math.exp(-local / 0.02) : 0;
+  });
+  const timeline = analyzeTimeline(buffer);
+  assert.ok(timeline.tempo, 'tempo should be detected');
+  assert.ok(Math.abs(timeline.tempo.bpm - 120) < 2, `bpm was ${timeline.tempo.bpm}`);
+  const phaseError = Math.abs(((timeline.tempo.offset - 0.25) % 0.5 + 0.75) % 0.5 - 0.25);
+  assert.ok(Math.min(phaseError, 0.5 - phaseError) < 0.03, `phase ${timeline.tempo.offset}`);
+  assert.ok(timeline.beats.length >= 28, `beats ${timeline.beats.length}`);
+});
+
+test('silence does not invent a beat grid', () => {
+  const timeline = analyzeTimeline(makeSignal(8000, 8, () => 0));
+  assert.equal(timeline.tempo, null);
+  assert.deepEqual(timeline.beats, []);
+});
+
+test('a sudden loudness lift is reported as a section boundary', () => {
+  const buffer = makeSignal(8000, 12, (t) => (t < 6 ? 0.1 : 0.6) * Math.sin(2 * Math.PI * 440 * t));
+  const { sections } = analyzeTimeline(buffer);
+  const lift = sections.find(item => item.kind === 'lift');
+  assert.ok(lift, 'expected a lift');
+  assert.ok(Math.abs(lift.time - 6) < 0.3, `lift at ${lift.time}`);
 });

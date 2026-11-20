@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownToLine, ArrowRight, ArrowUpRight, AudioLines, Check, ChevronRight,
-  CircleHelp, Clapperboard, FileAudio, Maximize2, MoveHorizontal,
-  Music2, Pause, Play, Plus, RotateCcw, Sparkles, Upload, Volume2, WandSparkles, X,
+  CircleHelp, Clapperboard, FileAudio, Maximize2,
+  Music2, Pause, Play, Plus, RotateCcw, Sparkles, Upload, Volume2, X,
 } from 'lucide-react';
 import PreviewCanvas from './PreviewCanvas.jsx';
-import { analyzeAudio, clamp, findBestHook, formatTime, manualCaptions, wordsToCaptions } from './audio.js';
+import Timeline from './Timeline.jsx';
+import { analyzeAudio, analyzeTimeline, clamp, findBestHook, formatTime, manualCaptions, scoreWindows } from './audio.js';
 
 const MAX_FILE_SIZE = 25 * 1024 * 1024;
 const DEMO_CAPTION = 'FEEL THE\nFREQUENCY';
@@ -61,64 +62,6 @@ function SectionHeading({ step, eyebrow, title, description, children }) {
   </div>;
 }
 
-function Waveform({ waveform, duration, start, length, onChange, disabled, empty }) {
-  const ref = useRef(null);
-  const dragging = useRef(null);
-  const safeDuration = duration || 1;
-  const x = clamp(start / safeDuration, 0, 1) * 1000;
-  const selectedWidth = clamp(length / safeDuration, 0, 1) * 1000;
-  const fromPointer = event => {
-    const bounds = ref.current.getBoundingClientRect();
-    const position = clamp((event.clientX - bounds.left) / bounds.width, 0, 1) * safeDuration;
-    onChange(clamp(position - (dragging.current ?? length / 2), 0, Math.max(0, safeDuration - length)));
-  };
-  return <div className={`waveform-wrap ${disabled ? 'disabled' : ''}`}>
-    <div className="waveform-topline"><span><span className="tiny-lime-dot" /> {empty ? 'NO TRACK YET' : 'THE GOOD PART'}</span><span><MoveHorizontal size={12} /> DRAG TO ADJUST</span></div>
-    <div
-      ref={ref}
-      className="waveform-interactive"
-      role="slider"
-      tabIndex={disabled ? -1 : 0}
-      aria-label="Clip start time"
-      aria-valuemin={0}
-      aria-valuemax={Math.max(0, Math.floor(safeDuration - length))}
-      aria-valuenow={Math.floor(start)}
-      aria-valuetext={`${formatTime(start)} to ${formatTime(start + length)}`}
-      onPointerDown={event => {
-        if (disabled || safeDuration <= length) return;
-        const bounds = ref.current.getBoundingClientRect();
-        const position = clamp((event.clientX - bounds.left) / bounds.width, 0, 1) * safeDuration;
-        dragging.current = position >= start && position <= start + length ? position - start : length / 2;
-        event.currentTarget.setPointerCapture(event.pointerId);
-        fromPointer(event);
-      }}
-      onPointerMove={event => { if (dragging.current !== null) fromPointer(event); }}
-      onPointerUp={() => { dragging.current = null; }}
-      onPointerCancel={() => { dragging.current = null; }}
-      onKeyDown={event => {
-        if (disabled) return;
-        if (event.key === 'ArrowRight' || event.key === 'ArrowUp') { event.preventDefault(); onChange(clamp(start + 1, 0, Math.max(0, safeDuration - length))); }
-        if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') { event.preventDefault(); onChange(clamp(start - 1, 0, Math.max(0, safeDuration - length))); }
-        if (event.key === 'Home') { event.preventDefault(); onChange(0); }
-        if (event.key === 'End') { event.preventDefault(); onChange(Math.max(0, safeDuration - length)); }
-      }}
-    >
-      <svg viewBox="0 0 1000 86" preserveAspectRatio="none" aria-hidden="true">
-        <rect x={x} y="1" width={selectedWidth} height="84" rx="4" fill="#c9f774" fillOpacity="0.07" />
-        <line x1={x} x2={x} y1="0" y2="86" stroke="#c9f774" strokeWidth="3" />
-        <line x1={x + selectedWidth} x2={x + selectedWidth} y1="0" y2="86" stroke="#c9f774" strokeWidth="3" />
-        {waveform.map((value, index) => {
-          const barX = index * 1000 / waveform.length;
-          const barHeight = Math.max(4, value * 67);
-          const selected = barX >= x && barX <= x + selectedWidth;
-          return <rect key={index} x={barX + 1} y={(86 - barHeight) / 2} width={Math.max(2, 1000 / waveform.length * 0.48)} height={barHeight} rx="2" fill={selected ? '#c9f774' : '#51545d'} opacity={selected ? 0.94 : 0.72} />;
-        })}
-      </svg>
-    </div>
-    <div className="waveform-times"><span>0:00</span><span>{formatTime(duration / 2)}</span><span>{formatTime(duration)}</span></div>
-  </div>;
-}
-
 function Modal({ children, onClose, label }) {
   useEffect(() => {
     const keyDown = event => { if (event.key === 'Escape') onClose(); };
@@ -136,14 +79,9 @@ function App() {
   const [clipLength, setClipLength] = useState(15);
   const [preset, setPreset] = useState('aurora');
   const [captionEnabled, setCaptionEnabled] = useState(true);
-  const [captionSource, setCaptionSource] = useState('demo');
   const [manualText, setManualText] = useState(DEMO_CAPTION);
-  const [whisperCaptions, setWhisperCaptions] = useState([]);
-  const [whisperWords, setWhisperWords] = useState([]);
-  const [whisperState, setWhisperState] = useState('idle');
-  const [whisperKey, setWhisperKey] = useState('');
-  const [keyDraft, setKeyDraft] = useState('');
-  const [apiStatus, setApiStatus] = useState({ whisperConfigured: false, mp4ExportAvailable: true });
+  const [apiStatus, setApiStatus] = useState({ mp4ExportAvailable: true });
+  const [timeline, setTimeline] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(8);
   const [draggingFile, setDraggingFile] = useState(false);
@@ -159,26 +97,15 @@ function App() {
   const timeRef = useRef(8);
   const objectUrlRef = useRef(null);
   const loadIdRef = useRef(0);
-  const hookAdjustedRef = useRef(false);
   const recorderRef = useRef(null);
   const finishRecordingRef = useRef(null);
-  const statusRef = useRef(apiStatus);
-  const statusPromiseRef = useRef(null);
-  const keyRef = useRef(whisperKey);
-  const clipLengthRef = useRef(clipLength);
   const downloadRef = useRef(null);
-  statusRef.current = apiStatus;
-  keyRef.current = whisperKey;
-  clipLengthRef.current = clipLength;
   downloadRef.current = download;
 
   const actualLength = Math.min(clipLength, track?.duration || clipLength);
   const waveform = analysis?.waveform || INITIAL_WAVE;
-  const captions = useMemo(() => captionSource === 'whisper'
-    ? whisperCaptions
-    : manualCaptions(manualText, hookStart, actualLength), [captionSource, whisperCaptions, manualText, hookStart, actualLength]);
-  const relevantWhisper = useMemo(() => whisperCaptions.filter(item => item.end >= hookStart && item.start < hookStart + actualLength), [whisperCaptions, hookStart, actualLength]);
-  const editorValue = captionSource === 'whisper' ? relevantWhisper.map(item => item.text).join('\n\n') : manualText;
+  const captions = useMemo(() => manualCaptions(manualText, hookStart, actualLength), [manualText, hookStart, actualLength]);
+  const hookCurve = useMemo(() => scoreWindows(analysis, actualLength), [analysis, actualLength]);
   const busy = ['preparing', 'recording', 'encoding'].includes(exportState.phase);
 
   const scrollTo = id => {
@@ -191,61 +118,20 @@ function App() {
     setCurrentTime(value);
   };
 
-  const transcribeFile = useCallback(async (file, key, nextAnalysis, requestId) => {
-    if (!file) return;
-    setWhisperState('loading');
-    setError('');
-    try {
-      const form = new FormData();
-      form.append('audio', file, file.name);
-      const response = await fetch('/api/transcribe', { method: 'POST', headers: key ? { 'X-Whisper-Key': key } : {}, body: form });
-      const data = await response.json();
-      if (!response.ok) {
-        const requestError = new Error(data.error || 'Transcription failed. Please try again.');
-        requestError.status = response.status;
-        throw requestError;
-      }
-      if (requestId !== loadIdRef.current) return;
-      const timed = wordsToCaptions(data.words, data.segments);
-      setWhisperWords(data.words || []);
-      if (!timed.length) {
-        setWhisperState('empty');
-        setCaptionSource('manual');
-        return;
-      }
-      setWhisperCaptions(timed);
-      setCaptionSource('whisper');
-      setWhisperState('done');
-      setCaptionEnabled(true);
-      if (nextAnalysis && !hookAdjustedRef.current) {
-        setHookStart(findBestHook(nextAnalysis, Math.min(clipLengthRef.current, nextAnalysis.duration), data.words || []));
-      }
-    } catch (err) {
-      if (requestId !== loadIdRef.current) return;
-      if (err.status === 401 && key) setWhisperKey('');
-      setWhisperState('error');
-      setError(err.message || 'Transcription failed. You can still add captions manually.');
-    }
-  }, []);
-
   const loadTrack = useCallback(async (file, isDemo = false) => {
     if (!file) return;
     if (!/\.mp3$/i.test(file.name)) { setError('Please choose an MP3 file.'); return; }
     if (file.size > MAX_FILE_SIZE) { setError('That file is over 25 MB. Please choose a smaller MP3.'); return; }
     const requestId = ++loadIdRef.current;
-    hookAdjustedRef.current = false;
     audioRef.current?.pause();
     setIsPlaying(false);
     setError('');
     setAnalyzing(true);
     setAnalysis(null);
+    setTimeline(null);
     setClipLength(15);
     setHookStart(0);
     updateTime(0);
-    setWhisperCaptions([]);
-    setWhisperWords([]);
-    setWhisperState('idle');
-    setCaptionSource(isDemo ? 'demo' : 'manual');
     setManualText(isDemo ? DEMO_CAPTION : '');
     setCaptionEnabled(true);
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
@@ -262,20 +148,15 @@ function App() {
       if (!Number.isFinite(buffer.duration) || buffer.duration <= 0) throw new Error('This MP3 does not contain playable audio.');
       if (buffer.duration < 1) throw new Error('Please choose an MP3 that is at least one second long.');
       const nextAnalysis = analyzeAudio(buffer);
+      const nextTimeline = analyzeTimeline(buffer);
       const length = Math.min(15, buffer.duration);
       const nextStart = findBestHook(nextAnalysis, length);
       setAnalysis(nextAnalysis);
+      setTimeline(nextTimeline);
       setTrack(current => current?.src === src ? { ...current, duration: buffer.duration } : current);
       setHookStart(nextStart);
       updateTime(nextStart);
-      // Wait for the server configuration if a track is picked immediately
-      // after page load, so an environment-configured Whisper key isn't missed.
-      const currentStatus = isDemo ? statusRef.current : await (statusPromiseRef.current || Promise.resolve(statusRef.current));
-      if (requestId !== loadIdRef.current) return;
       setAnalyzing(false);
-      if (!isDemo && (currentStatus.whisperConfigured || keyRef.current)) {
-        void transcribeFile(file, keyRef.current, nextAnalysis, requestId);
-      }
     } catch (err) {
       if (requestId !== loadIdRef.current) return;
       if (!isDemo && objectUrlRef.current === src) {
@@ -286,13 +167,11 @@ function App() {
       setTrack(null);
       setError(err.message || 'We could not read that MP3. Please try another file.');
     }
-  }, [transcribeFile]);
+  }, []);
 
   useEffect(() => {
     const initialLoadId = loadIdRef.current;
-    const statusPromise = fetch('/api/status').then(response => response.json()).catch(() => ({ whisperConfigured: false, mp4ExportAvailable: false }));
-    statusPromiseRef.current = statusPromise;
-    statusPromise.then(setApiStatus);
+    fetch('/api/status').then(response => response.json()).then(setApiStatus).catch(() => setApiStatus({ mp4ExportAvailable: false }));
     fetch('/midnight-motion.mp3').then(response => {
       if (!response.ok) throw new Error('Demo unavailable');
       return response.blob();
@@ -328,7 +207,7 @@ function App() {
       return null;
     });
     setExportState(previous => previous.phase === 'done' || previous.phase === 'error' ? { phase: 'idle', message: '' } : previous);
-  }, [track?.src, hookStart, clipLength, preset, captionEnabled, captionSource, manualText, whisperCaptions]);
+  }, [track?.src, hookStart, clipLength, preset, captionEnabled, manualText]);
 
   const ensureAudioGraph = async () => {
     if (!audioRef.current) throw new Error('Choose a track first.');
@@ -389,7 +268,6 @@ function App() {
 
   const setSelection = next => {
     if (!track || busy) return;
-    hookAdjustedRef.current = true;
     audioRef.current?.pause();
     setIsPlaying(false);
     setHookStart(Math.round(clamp(next, 0, Math.max(0, track.duration - actualLength)) * 10) / 10);
@@ -401,24 +279,7 @@ function App() {
     setIsPlaying(false);
     setClipLength(next);
     const length = Math.min(next, track.duration);
-    setHookStart(analysis ? findBestHook(analysis, length, whisperWords) : clamp(hookStart, 0, Math.max(0, track.duration - length)));
-    hookAdjustedRef.current = false;
-  };
-
-  const startTranscription = () => {
-    if (!track?.file || analyzing || busy) return;
-    if (!apiStatus.whisperConfigured && !whisperKey) { setKeyDraft(''); setModal('whisper'); return; }
-    void transcribeFile(track.file, whisperKey, analysis, loadIdRef.current);
-  };
-
-  const connectWhisper = event => {
-    event.preventDefault();
-    const key = keyDraft.trim();
-    if (!key || !track?.file) return;
-    setWhisperKey(key);
-    setKeyDraft('');
-    setModal(null);
-    void transcribeFile(track.file, key, analysis, loadIdRef.current);
+    setHookStart(analysis ? findBestHook(analysis, length) : clamp(hookStart, 0, Math.max(0, track.duration - length)));
   };
 
   const resetProject = () => {
@@ -429,17 +290,14 @@ function App() {
     objectUrlRef.current = null;
     setTrack(null);
     setAnalysis(null);
+    setTimeline(null);
     setAnalyzing(false);
     setHookStart(0);
     setClipLength(15);
     updateTime(0);
     setIsPlaying(false);
     setPreset('aurora');
-    setCaptionSource('manual');
     setManualText('');
-    setWhisperWords([]);
-    setWhisperCaptions([]);
-    setWhisperState('idle');
     setCaptionEnabled(true);
     setError('');
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -461,7 +319,7 @@ function App() {
   };
 
   const exportVideo = async () => {
-    if (!track || analyzing || busy || whisperState === 'loading') return;
+    if (!track || analyzing || busy) return;
     const canvas = canvasRef.current;
     if (!canvas?.captureStream || !window.MediaRecorder) {
       setError('Video recording is not supported in this browser. Try a current version of Chrome or Edge.');
@@ -562,7 +420,6 @@ function App() {
 
   const relativeTime = clamp(currentTime - hookStart, 0, actualLength);
   const progress = actualLength ? relativeTime / actualLength : 0;
-  const transcribeLabel = whisperState === 'loading' ? 'Transcribing…' : whisperState === 'done' ? 'Transcribe again' : 'Transcribe with Whisper';
 
   return <div className="app-shell" id="top">
     <Sidebar onHow={() => setModal('how')} onNavigate={scrollTo} hasTrack={Boolean(track)} />
@@ -589,7 +446,7 @@ function App() {
               <input ref={fileInputRef} className="visually-hidden" type="file" accept=".mp3,audio/mpeg" onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void loadTrack(file); }} />
               <div className={`upload-zone ${draggingFile ? 'is-dragging' : ''} ${busy ? 'disabled' : ''}`} onClick={() => { if (!busy) fileInputRef.current?.click(); }} onDragOver={event => { event.preventDefault(); if (!busy) setDraggingFile(true); }} onDragLeave={() => setDraggingFile(false)} onDrop={event => { event.preventDefault(); setDraggingFile(false); if (!busy) void loadTrack(event.dataTransfer.files?.[0]); }}>
                 <div className="upload-icon"><Upload size={19} /></div>
-                <div className="upload-copy"><strong>Drop your MP3 here <span>or</span> <button disabled={busy} onClick={event => { event.stopPropagation(); fileInputRef.current?.click(); }}>browse files</button></strong><small>Up to 25 MB <i /> 1s minimum <i /> Whisper sends audio to OpenAI</small></div>
+                <div className="upload-copy"><strong>Drop your MP3 here <span>or</span> <button disabled={busy} onClick={event => { event.stopPropagation(); fileInputRef.current?.click(); }}>browse files</button></strong><small>Up to 25 MB <i /> 1s minimum <i /> Analyzed in your browser</small></div>
                 <span className="upload-arrow"><ArrowUpRight size={16} /></span>
               </div>
               {track ? <div className="track-row">
@@ -605,12 +462,12 @@ function App() {
               <SectionHeading step="02" eyebrow="FIND THE MOMENT" title="Pick your hook" description="We found a good bit. Make it your own.">
                 <span className="found-pill"><Sparkles size={12} /> {!track ? 'AWAITING TRACK' : analyzing ? 'LISTENING' : 'HOOK FOUND'}</span>
               </SectionHeading>
-              <Waveform waveform={waveform} duration={track?.duration || 32} start={hookStart} length={actualLength} onChange={setSelection} disabled={!track || analyzing || busy} empty={!track} />
+              <Timeline timeline={timeline} hook={hookCurve} duration={track?.duration || 32} start={hookStart} length={actualLength} onChange={setSelection} disabled={!track || analyzing || busy} empty={!track} audioRef={audioRef} playing={isPlaying} />
               <div className="hook-bottom">
                 <div className="selection-copy"><span className="selection-icon"><AudioLines size={15} /></span><span><small>YOUR SELECTED MOMENT</small><strong>{track ? formatTime(hookStart) : '—:—'} <span>—</span> {track ? formatTime(hookStart + actualLength) : '—:—'}</strong></span></div>
                 <div className="duration-control"><span>CLIP LENGTH</span><div className="segmented"><button className={clipLength === 15 ? 'selected' : ''} onClick={() => setLength(15)} disabled={!track || busy}>15s</button><button className={clipLength === 30 ? 'selected' : ''} onClick={() => setLength(30)} disabled={!track || busy || track.duration < 30} title={track && track.duration < 30 ? 'Track is shorter than 30 seconds' : ''}>30s</button></div></div>
               </div>
-              <div className="hook-explainer"><Sparkles size={13} /><span>{track ? <>Selected for energy and dynamics{whisperState === 'done' && whisperWords.length ? ', with a boost for repeated lyrics' : ''}.</> : 'Upload a track to discover your hook.'}</span><button onClick={() => { if (analysis) { hookAdjustedRef.current = false; setSelection(findBestHook(analysis, actualLength, whisperWords)); hookAdjustedRef.current = false; } }} disabled={!analysis || busy}>Find again <RotateCcw size={11} /></button></div>
+              <div className="hook-explainer"><Sparkles size={13} /><span>{track ? 'Scored for sustained energy and dynamics. The curve above shows how strong a clip would be from every start point.' : 'Upload a track to discover your hook.'}</span><button onClick={() => { if (analysis) setSelection(findBestHook(analysis, actualLength)); }} disabled={!analysis || busy}>Find again <RotateCcw size={11} /></button></div>
             </section>
 
             <section className="editor-card style-card" id="style-section">
@@ -625,12 +482,9 @@ function App() {
                 </button>)}
               </div>
               <div className="caption-divider" />
-              <div className="caption-heading"><div><span className="control-title">CAPTIONS</span><span className="whisper-label">✦ WHISPER POWERED</span></div><label className="switch-label"><span>{captionEnabled ? 'On' : 'Off'}</span><input type="checkbox" checked={captionEnabled} onChange={event => setCaptionEnabled(event.target.checked)} disabled={busy} /><i /></label></div>
-              <p className="caption-description">Add your own words, or let Whisper find the lyrics.</p>
-              <textarea value={editorValue} onChange={event => { setManualText(event.target.value); setCaptionSource('manual'); }} placeholder="Add a caption for your video…" disabled={busy || !captionEnabled} aria-label="Caption text" rows={3} />
-              <div className="caption-actions"><span>{captionSource === 'whisper' ? 'Whisper timings are synced to your track. Editing uses even timing.' : 'Separate captions with a blank line for even timing.'}</span><button className="transcribe-button" onClick={startTranscription} disabled={!track || analyzing || busy || whisperState === 'loading'}><WandSparkles size={14} /> {transcribeLabel}</button></div>
-              {whisperState === 'empty' && <p className="inline-note">No speech was detected. You can add your own captions above.</p>}
-              {whisperState === 'error' && <p className="inline-note inline-error">{error || 'Transcription failed. Try again or add captions manually.'}</p>}
+              <div className="caption-heading"><div><span className="control-title">CAPTIONS</span></div><label className="switch-label"><span>{captionEnabled ? 'On' : 'Off'}</span><input type="checkbox" checked={captionEnabled} onChange={event => setCaptionEnabled(event.target.checked)} disabled={busy} /><i /></label></div>
+              <p className="caption-description">Type your own words. Separate captions with a blank line to spread them evenly across the clip.</p>
+              <textarea value={manualText} onChange={event => setManualText(event.target.value)} placeholder="Add a caption for your video…" disabled={busy || !captionEnabled} aria-label="Caption text" rows={3} />
               {track?.isDemo && <p className="inline-note">Demo captions are creative text, not a transcription of the instrumental.</p>}
             </section>
             <div className="editor-footnote"><span>✳</span> MADE FOR THE MOMENTS THAT MOVE YOU <span>✳</span></div>
@@ -640,7 +494,7 @@ function App() {
             <div className="preview-card">
               <div className="preview-header"><div><div className="section-eyebrow">A LITTLE SNEAK PEEK</div><h2>Live preview <span className="live-dot" /></h2></div><span className="aspect-pill"><Maximize2 size={13} /> 9:16</span></div>
               <div className="preview-stage"><span className="stage-corner top-left" /><span className="stage-corner top-right" /><span className="stage-corner bottom-left" /><span className="stage-corner bottom-right" />
-                <div className="preview-phone"><PreviewCanvas ref={canvasRef} trackName={track?.name} preset={preset} analyserRef={analyserRef} timeRef={timeRef} hookStart={hookStart} clipLength={actualLength} waveform={waveform} captions={captions} captionEnabled={captionEnabled} captionSource={captionSource} /></div>
+                <div className="preview-phone"><PreviewCanvas ref={canvasRef} trackName={track?.name} preset={preset} analyserRef={analyserRef} audioRef={audioRef} timeRef={timeRef} isPlaying={isPlaying} hookStart={hookStart} clipLength={actualLength} waveform={waveform} tempo={timeline?.tempo || null} captions={captions} captionEnabled={captionEnabled} /></div>
                 <div className="stage-side-label">YOUR SOUND. YOUR STORY.</div>
               </div>
               <div className="playback-row">
@@ -649,7 +503,7 @@ function App() {
                 <Volume2 size={16} className="volume-icon" />
               </div>
               <div className="export-area">
-                {download ? <a className="export-button download-button" href={download.url} download={download.filename}><ArrowDownToLine size={17} /> Download {download.format}<ArrowUpRight size={16} className="export-arrow" /></a> : <button className="export-button" onClick={exportVideo} disabled={!track || analyzing || busy || whisperState === 'loading' || !apiStatus.mp4ExportAvailable}><ArrowDownToLine size={17} />{exportState.phase === 'preparing' ? 'Preparing your clip…' : exportState.phase === 'recording' ? `Recording ${formatTime(relativeTime)} / ${formatTime(actualLength)}` : exportState.phase === 'encoding' ? 'Finishing your MP4…' : whisperState === 'loading' ? 'Waiting for Whisper…' : 'Export video'}<ArrowUpRight size={16} className="export-arrow" /></button>}
+                {download ? <a className="export-button download-button" href={download.url} download={download.filename}><ArrowDownToLine size={17} /> Download {download.format}<ArrowUpRight size={16} className="export-arrow" /></a> : <button className="export-button" onClick={exportVideo} disabled={!track || analyzing || busy || !apiStatus.mp4ExportAvailable}><ArrowDownToLine size={17} />{exportState.phase === 'preparing' ? 'Preparing your clip…' : exportState.phase === 'recording' ? `Recording ${formatTime(relativeTime)} / ${formatTime(actualLength)}` : exportState.phase === 'encoding' ? 'Finishing your MP4…' : 'Export video'}<ArrowUpRight size={16} className="export-arrow" /></button>}
                 {exportState.message ? <div className={`export-message ${exportState.phase === 'error' ? 'is-error' : ''}`}>{exportState.phase === 'done' && <Check size={13} />}{exportState.message}</div> : <div className="export-meta"><span>MP4</span><i /> <span>1080 × 1920</span><i /> <span>READY TO SHARE</span></div>}
                 {download && <button className="render-again" onClick={exportVideo} disabled={busy}>Render again <RotateCcw size={11} /></button>}
                 {!apiStatus.mp4ExportAvailable && <div className="export-message is-error">MP4 export is unavailable on this server.</div>}
@@ -663,8 +517,7 @@ function App() {
       <audio ref={audioRef} src={track?.src || undefined} preload="auto" onTimeUpdate={onAudioTimeUpdate} onLoadedMetadata={() => { if (audioRef.current && hookStart > 0) { try { audioRef.current.currentTime = hookStart; } catch { /* ignored */ } } }} onEnded={() => { setIsPlaying(false); finishRecordingRef.current?.(); }} />
     </div>
 
-    {modal === 'how' && <Modal label="How mp3vid works" onClose={() => setModal(null)}><button className="modal-close" onClick={() => setModal(null)} aria-label="Close"><X size={18} /></button><div className="modal-icon"><Sparkles size={20} /></div><div className="section-eyebrow">THE SHORT VERSION</div><h2>From sound to scroll-stopper.</h2><p className="modal-intro">Everything you need to give your music a moment in the spotlight.</p><div className="how-list"><div><span>01</span><p><strong>Bring your track</strong><small>Upload an MP3 and we’ll analyze its sound right here in your browser.</small></p></div><div><span>02</span><p><strong>Find the good bit</strong><small>We suggest a high-energy hook. Drag the waveform to choose your own.</small></p></div><div><span>03</span><p><strong>Make it yours</strong><small>Pick a sound-reactive look and add captions, or transcribe with Whisper.</small></p></div><div><span>04</span><p><strong>Put it out there</strong><small>Render a vertical MP4, ready for TikTok, Reels, or YouTube Shorts.</small></p></div></div><button className="modal-primary" onClick={() => setModal(null)}>Let’s make something <ArrowRight size={16} /></button></Modal>}
-    {modal === 'whisper' && <Modal label="Connect Whisper" onClose={() => setModal(null)}><button className="modal-close" onClick={() => setModal(null)} aria-label="Close"><X size={18} /></button><div className="modal-icon"><WandSparkles size={20} /></div><div className="section-eyebrow">LET THE LYRICS SPEAK</div><h2>Connect Whisper.</h2><p className="modal-intro">Turn vocals into time-synced captions with an OpenAI API key. You can always add captions manually instead.</p><form onSubmit={connectWhisper}><label className="key-label" htmlFor="whisper-key">OPENAI API KEY</label><input id="whisper-key" className="key-input" type="password" value={keyDraft} onChange={event => setKeyDraft(event.target.value)} placeholder="Enter your API key" autoComplete="off" autoFocus /><p className="key-note">Your key stays in this browser session and is not saved by the server. Audio is sent to OpenAI; the server needs access to api.openai.com. Usage charges may apply.</p><button type="submit" className="modal-primary" disabled={!keyDraft.trim()}>Transcribe track <ArrowRight size={16} /></button></form><button className="modal-secondary" onClick={() => setModal(null)}>I’ll add captions myself</button></Modal>}
+    {modal === 'how' && <Modal label="How mp3vid works" onClose={() => setModal(null)}><button className="modal-close" onClick={() => setModal(null)} aria-label="Close"><X size={18} /></button><div className="modal-icon"><Sparkles size={20} /></div><div className="section-eyebrow">THE SHORT VERSION</div><h2>From sound to scroll-stopper.</h2><p className="modal-intro">Everything you need to give your music a moment in the spotlight.</p><div className="how-list"><div><span>01</span><p><strong>Bring your track</strong><small>Upload an MP3 and we’ll analyze its sound right here in your browser.</small></p></div><div><span>02</span><p><strong>Find the good bit</strong><small>Zoom into the map to see beats, sections, and silence. We suggest a high-energy hook; drag to choose your own.</small></p></div><div><span>03</span><p><strong>Make it yours</strong><small>Pick a sound-reactive look and add your own captions.</small></p></div><div><span>04</span><p><strong>Put it out there</strong><small>Render a vertical MP4, ready for TikTok, Reels, or YouTube Shorts.</small></p></div></div><button className="modal-primary" onClick={() => setModal(null)}>Let’s make something <ArrowRight size={16} /></button></Modal>}
   </div>;
 }
 
