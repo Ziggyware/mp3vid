@@ -19,8 +19,6 @@ if (!ffmpegPath) {
     // studio can still run; users can provide FFMPEG_PATH for MP4 export.
   }
 }
-const maxTrackBytes = 25 * 1024 * 1024;
-const trackUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: maxTrackBytes, files: 1 } });
 const videoUpload = multer({ dest: tmpdir(), limits: { fileSize: 200 * 1024 * 1024, files: 1 } });
 
 let ffmpegAvailable = false;
@@ -32,42 +30,7 @@ try {
 }
 
 app.get('/api/status', (_req, res) => {
-  res.json({ whisperConfigured: Boolean(process.env.OPENAI_API_KEY), mp4ExportAvailable: ffmpegAvailable });
-});
-
-app.post('/api/transcribe', trackUpload.single('audio'), async (req, res) => {
-  const apiKey = req.get('X-Whisper-Key')?.trim() || process.env.OPENAI_API_KEY;
-  if (!apiKey) return res.status(401).json({ error: 'Connect an OpenAI API key to transcribe with Whisper, or add captions manually.' });
-  if (!req.file) return res.status(400).json({ error: 'Please choose an MP3 first.' });
-  if (!/\.mp3$/i.test(req.file.originalname)) return res.status(400).json({ error: 'Whisper transcription requires an MP3 file.' });
-
-  try {
-    const form = new FormData();
-    form.append('file', new Blob([req.file.buffer], { type: 'audio/mpeg' }), req.file.originalname);
-    form.append('model', 'whisper-1');
-    form.append('response_format', 'verbose_json');
-    form.append('timestamp_granularities[]', 'word');
-    form.append('timestamp_granularities[]', 'segment');
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}` },
-      body: form,
-      signal: AbortSignal.timeout(120_000),
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      // Do not include the key or the upstream response body in logs.
-      return res.status(response.status === 401 ? 401 : 502).json({
-        error: data?.error?.message || 'Whisper could not transcribe this track. Please try again.',
-      });
-    }
-    res.json({ text: data.text || '', words: data.words || [], segments: data.segments || [] });
-  } catch (error) {
-    const message = error.name === 'TimeoutError'
-      ? 'Whisper took too long to respond. Please try again.'
-      : 'Could not reach Whisper. Check the server’s network connection and try again.';
-    res.status(502).json({ error: message });
-  }
+  res.json({ mp4ExportAvailable: ffmpegAvailable });
 });
 
 function convertToMp4(input, output, duration) {
@@ -122,7 +85,7 @@ app.post('/api/export', videoUpload.single('video'), async (req, res) => {
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     const message = error.code === 'LIMIT_FILE_SIZE'
-      ? (req.path === '/api/export' ? 'This recording is too large to convert.' : 'This file is too large. MP3s must be 25 MB or less.')
+      ? 'This recording is too large to convert.'
       : 'There was a problem uploading this file.';
     return res.status(400).json({ error: message });
   }
