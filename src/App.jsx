@@ -148,7 +148,13 @@ function App() {
       if (!Number.isFinite(buffer.duration) || buffer.duration <= 0) throw new Error('This MP3 does not contain playable audio.');
       if (buffer.duration < 1) throw new Error('Please choose an MP3 that is at least one second long.');
       const nextAnalysis = analyzeAudio(buffer);
+      // Yield so the "Analyzing…" state can paint and the tab stays
+      // responsive instead of blocking on the full analysis at once.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (requestId !== loadIdRef.current) return;
       const nextTimeline = analyzeTimeline(buffer);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (requestId !== loadIdRef.current) return;
       const length = Math.min(15, buffer.duration);
       const nextStart = findBestHook(nextAnalysis, length);
       setAnalysis(nextAnalysis);

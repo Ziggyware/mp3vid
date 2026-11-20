@@ -330,6 +330,15 @@ const PreviewCanvas = forwardRef(function PreviewCanvas(props, ref) {
     let lastDraw = 0;
     const started = performance.now();
     const frequencies = new Uint8Array(128);
+    // Gradients depend only on the fixed canvas size, so build them once
+    // instead of recreating them on every animation frame.
+    const topShade = ctx.createLinearGradient(0, 0, 0, height * 0.24);
+    topShade.addColorStop(0, 'rgba(4,5,18,.66)');
+    topShade.addColorStop(1, 'rgba(4,5,18,0)');
+    const bottomShade = ctx.createLinearGradient(0, height * 0.53, 0, height);
+    bottomShade.addColorStop(0, 'rgba(3,4,16,0)');
+    bottomShade.addColorStop(0.5, 'rgba(3,4,16,.37)');
+    bottomShade.addColorStop(1, 'rgba(3,4,16,.85)');
 
     // The audio clock is smoother than timeupdate, so read it directly while playing.
     function trackTime(p) {
@@ -338,13 +347,19 @@ const PreviewCanvas = forwardRef(function PreviewCanvas(props, ref) {
       return p.timeRef?.current ?? p.hookStart ?? 0;
     }
 
-    function render(now) {
-      // The recorder captures at 30 fps; avoid drawing twice as often on 60 Hz screens.
-      if (now - lastDraw < 1000 / 30) {
-        frame = requestAnimationFrame(render);
-        return;
-      }
-      lastDraw = now;
+    // When paused, only redraw if something visible changed. This keeps the
+    // preview static (and the CPU/GPU idle) instead of animating at 30 fps
+    // forever, which can make low-powered machines feel frozen on load.
+    let lastSignature = '';
+    function previewSignature(p) {
+      const t = trackTime(p);
+      const captionText = (p.captions || []).map(caption => caption.text).join('|');
+      const tempoKey = p.tempo ? `${p.tempo.bpm}|${p.tempo.offset}` : '';
+      const imagesKey = visualizer.images.map(item => (item.image.complete && item.image.naturalWidth ? 1 : 0)).join('');
+      return [Math.round(t * 10), p.preset, tempoKey, p.trackName || '', p.hookStart, p.clipLength, p.captionEnabled ? 1 : 0, captionText, (p.waveform || []).length, imagesKey].join('::');
+    }
+
+    function drawFrame(now) {
       const p = propsRef.current;
       const analyser = p.analyserRef?.current;
       if (analyser) {
@@ -355,7 +370,9 @@ const PreviewCanvas = forwardRef(function PreviewCanvas(props, ref) {
           frequencies.set(data.subarray(0, frequencies.length));
         } else analyser.getByteFrequencyData(frequencies);
       } else frequencies.fill(0);
-      const bassValue = Array.from(frequencies.slice(1, 9)).reduce((sum, x) => sum + x, 0) / (8 * 255);
+      let bassSum = 0;
+      for (let i = 1; i < 9; i++) bassSum += frequencies[i];
+      const bassValue = bassSum / (8 * 255);
       smoothBass += (bassValue - smoothBass) * 0.16;
 
       const current = trackTime(p);
@@ -369,7 +386,9 @@ const PreviewCanvas = forwardRef(function PreviewCanvas(props, ref) {
       const previousDirection = -direction;
       const frameState = {
         schedule,
-        time: (now - started) / 1000,
+        // Wall-clock drift while playing; audio time when paused so the
+        // static frame is stable instead of jumping on every redraw.
+        time: p.isPlaying ? (now - started) / 1000 : current,
         bass: smoothBass,
         flash: burst + beatFlash,
         style: p.preset === 'tide' ? 1 : p.preset === 'mono' ? 2 : 0,
@@ -403,15 +422,8 @@ const PreviewCanvas = forwardRef(function PreviewCanvas(props, ref) {
       }
 
       // Safe-area shading keeps text legible while the artwork moves underneath.
-      const topShade = ctx.createLinearGradient(0, 0, 0, height * 0.24);
-      topShade.addColorStop(0, 'rgba(4,5,18,.66)');
-      topShade.addColorStop(1, 'rgba(4,5,18,0)');
       ctx.fillStyle = topShade;
       ctx.fillRect(0, 0, width, height * 0.24);
-      const bottomShade = ctx.createLinearGradient(0, height * 0.53, 0, height);
-      bottomShade.addColorStop(0, 'rgba(3,4,16,0)');
-      bottomShade.addColorStop(0.5, 'rgba(3,4,16,.37)');
-      bottomShade.addColorStop(1, 'rgba(3,4,16,.85)');
       ctx.fillStyle = bottomShade;
       ctx.fillRect(0, height * 0.53, width, height * 0.47);
 
@@ -476,6 +488,27 @@ const PreviewCanvas = forwardRef(function PreviewCanvas(props, ref) {
       ctx.textAlign = 'right';
       ctx.fillStyle = 'rgba(255,255,255,.48)';
       ctx.fillText('MADE TO BE FELT', width - pad, height * 0.939);
+    }
+
+    function render(now) {
+      const p = propsRef.current;
+      if (!p.isPlaying) {
+        const signature = previewSignature(p);
+        if (signature !== lastSignature) {
+          lastSignature = signature;
+          drawFrame(now);
+        }
+        frame = requestAnimationFrame(render);
+        return;
+      }
+      lastSignature = '';
+      // The recorder captures at 30 fps; avoid drawing twice as often on 60 Hz screens.
+      if (now - lastDraw < 1000 / 30) {
+        frame = requestAnimationFrame(render);
+        return;
+      }
+      lastDraw = now;
+      drawFrame(now);
       frame = requestAnimationFrame(render);
     }
     frame = requestAnimationFrame(render);
